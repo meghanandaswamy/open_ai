@@ -81,7 +81,7 @@ Based on the following internal documentation:
 {context}
 \"\"\"
 
-Generate **3 real-world test scenarios** for the Finacle menu named **"{menu}"**:
+Generate **3 real-world test scenarios** in 1 or 2 sentences for the Finacle menu named **"{question}"**:
 1. A positive test scenario covering the main business path.
 2. Another positive test covering an alternate valid path.
 3. A negative test scenario handling invalid or edge input.
