@@ -1,116 +1,131 @@
 import os
-import pandas as pd
+import glob
 import docx
-from pathlib import Path
-import google.generativeai as genai
-from chromadb import PersistentClient
-from chromadb.utils import embedding_functions
-import time
+import pandas as pd
+from dotenv import load_dotenv
+from typing import List
+import openai
+import tiktoken
 
-# Configure Gemini API
-genai.configure(api_key="AIzaSyAkdFOq1j6Gl2bbbwMhzldHq5VkxCAyE1Q")
-model = genai.GenerativeModel("gemini-1.5-pro")
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.document_loaders import TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
 
-# Path to documents
-DOCS_FOLDER = r"C:\Users\Meghananda\Downloads\Finacle user manual"
+# Load API key
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Load documents
-def load_documents(folder_path):
-    docs = []
-    for file in Path(folder_path).rglob("*"):
-        if file.suffix.lower() == ".txt":
-            with open(file, "r", encoding="utf-8") as f:
-                docs.append((str(file), f.read()))
-        elif file.suffix.lower() == ".docx":
-            doc = docx.Document(file)
-            full_text = "\n".join([p.text for p in doc.paragraphs])
-            docs.append((str(file), full_text))
-        elif file.suffix.lower() in [".xls", ".xlsx"]:
-            try:
-                df = pd.read_excel(file)
-                docs.append((str(file), df.to_string()))
-            except Exception as e:
-                print(f"Failed to read {file}: {e}")
-    return docs
+# Paths
+DOCS_FOLDER = "docs"
+MENU_EXCEL_PATH = r"C:\Users\Meghananda\PycharmProjects\PythonProject4\docs\finacle_menus.xlsx"
+CHROMA_PATH = "rag_store"
 
-# Split into chunks
-def split_into_chunks(text, chunk_size=500):
-    words = text.split()
-    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+# Tokenizer
+tokenizer = tiktoken.get_encoding("cl100k_base")  # GPT-4 tokenizer
 
-# Estimate token count
-def estimate_tokens(text):
-    return int(len(text.split()) / 0.75)
 
-# Truncate to token limit
-def truncate_context_to_token_limit(context_chunks, token_limit):
-    combined = ""
+def load_word_documents(folder_path: str) -> List[Document]:
+    documents = []
+    for file in glob.glob(os.path.join(folder_path, "*.docx")):
+        doc = docx.Document(file)
+        text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+        if text:
+            documents.append(Document(page_content=text, metadata={"source": file}))
+    return documents
+
+
+def load_menu_names(excel_path: str) -> List[str]:
+    df = pd.read_excel(excel_path)
+    return df.iloc[:, 0].dropna().astype(str).tolist()
+
+
+def chunk_documents(docs: List[Document], chunk_size=800, chunk_overlap=100):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return splitter.split_documents(docs)
+
+
+def build_vectorstore(chunks: List[Document]):
+    if os.path.exists(CHROMA_PATH):
+        db = Chroma(persist_directory=CHROMA_PATH, embedding_function=OpenAIEmbeddings())
+    else:
+        db = Chroma.from_documents(chunks, OpenAIEmbeddings(), persist_directory=CHROMA_PATH)
+        db.persist()
+    return db
+
+
+def get_token_limited_context(chunks: List[str], max_tokens: int) -> str:
     total_tokens = 0
-    for chunk in context_chunks:
-        chunk_tokens = estimate_tokens(chunk)
-        if total_tokens + chunk_tokens > token_limit:
+    final_chunks = []
+    for chunk in chunks:
+        tokens = len(tokenizer.encode(chunk))
+        if total_tokens + tokens <= max_tokens:
+            final_chunks.append(chunk)
+            total_tokens += tokens
+        else:
             break
-        combined += chunk + "\n\n"
-        total_tokens += chunk_tokens
-    return combined, total_tokens
+    return "\n".join(final_chunks)
 
-# Build vector store
-def build_vector_store(documents, db_path="rag_db"):
-    client = PersistentClient(path=db_path)
-    collection = client.get_or_create_collection(
-        name="finacle_docs",
-        embedding_function=embedding_functions.GoogleGenerativeAiEmbeddingFunction(
-            api_key="AIzaSyAkdFOq1j6Gl2bbbwMhzldHq5VkxCAyE1Q",
-            model_name="models/embedding-001"
-        )
-    )
 
-    for idx, (filename, content) in enumerate(documents):
-        chunks = split_into_chunks(content)
-        for j, chunk in enumerate(chunks):
-            collection.add(
-                documents=[chunk],
-                metadatas=[{"filename": filename}],
-                ids=[f"{idx}_{j}"]
-            )
-    return collection
+def generate_test_scenarios(menu: str, db, max_context_tokens=800) -> str:
+    search = db.similarity_search(menu, k=5)
+    raw_chunks = [doc.page_content for doc in search]
+    context = get_token_limited_context(raw_chunks, max_context_tokens)
 
-# Generate test scenario
-def generate_test_scenario(user_input, collection, top_k=3, token_limit=1000):
-    results = collection.query(query_texts=[user_input], n_results=top_k)
-    raw_chunks = [doc for doc in results["documents"][0]]
+    prompt = f"""
+You are a senior test engineer for the Finacle core banking application.
 
-    context, used_tokens = truncate_context_to_token_limit(raw_chunks, token_limit)
-    print(f"[INFO] Approx. tokens in prompt context: {used_tokens} / {token_limit}")
+Based on the following internal documentation:
+\"\"\"
+{context}
+\"\"\"
 
-    prompt = f"""You are a Finacle test engineer.
-Using the following documentation chunks:\n\n{context}\n\n
-Generate detailed test scenarios based on this user request: "{user_input}"
+Generate **3 real-world test scenarios** for the Finacle menu named **"{menu}"**:
+1. A positive test scenario covering the main business path.
+2. Another positive test covering an alternate valid path.
+3. A negative test scenario handling invalid or edge input.
+
+Give the output in a clear bullet-point list.
 """
-
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        response = openai.ChatCompletion.create(
+            model="gpt-4",  # or "gpt-3.5-turbo" for cost saving
+            messages=[
+                {"role": "system", "content": "You are an expert in banking software QA."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=600
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"[ERROR] {e}"
+        return f"[ERROR]: {e}"
 
-# Main program
+
 if __name__ == "__main__":
-    print("🔍 Loading and processing Finacle documents...")
-    docs = load_documents(DOCS_FOLDER)
-    collection = build_vector_store(docs)
+    print("🔍 Loading documents...")
+    docs = load_word_documents(DOCS_FOLDER)
+    chunks = chunk_documents(docs)
+    db = build_vectorstore(chunks)
 
-    try:
-        user_token_limit = int(input("Enter maximum prompt token limit (e.g., 800, 1000): "))
-    except:
-        user_token_limit = 1000
+    menus = load_menu_names(MENU_EXCEL_PATH)
 
-    print("✅ Ready to generate Finacle test scenarios!")
+    print("\n📋 Available Menus:")
+    for idx, name in enumerate(menus, 1):
+        break
+        # print(f"{idx}. {name}")
+
+    print("\nEnter menu name (or type 'exit'):")
     while True:
-        query = input("\nEnter your Finacle test scenario request (or type 'exit'): ")
-        if query.lower() == "exit":
+        menu = input("🔸 Menu: ").strip()
+        if menu.lower() == "exit":
             break
-        scenario = generate_test_scenario(query, collection, top_k=3, token_limit=user_token_limit)
-        print("\n📄 Generated Test Scenario:\n")
-        print(scenario)
-        time.sleep(5)  # avoid rapid-fire requests
+        if menu not in menus:
+            print("❌ Menu not found. Please enter a valid menu from the list.")
+            continue
+
+        print(f"\n📄 Generating test scenarios for: {menu}")
+        result = generate_test_scenarios(menu, db)
+        print(result)
+        print("-" * 60)
