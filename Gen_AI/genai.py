@@ -114,7 +114,7 @@ if __name__ == "__main__":
     print("\n📋 Available Menus:")
     for idx, name in enumerate(menus, 1):
         break
-        # print(f"{idx}. {name}")
+        print(f"{idx}. {name}")
 
     print("\nEnter menu name (or type 'exit'):")
     while True:
